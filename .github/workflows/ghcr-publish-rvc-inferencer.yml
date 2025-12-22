@@ -20,12 +20,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install AWS CLI v2
+      - name: Ensure AWS CLI v2
+        shell: bash
         run: |
           set -euo pipefail
+          if command -v aws >/dev/null 2>&1; then
+            aws --version
+            exit 0
+          fi
           curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip -q awscliv2.zip
-          sudo ./aws/install
+          sudo ./aws/install --update
           aws --version
 
       - name: Download baked HuBERT from B2 (rvc-inferencing-assets)
@@ -33,11 +38,12 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.B2_RVC_ASSETS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_RVC_ASSETS_APP_KEY }}
           AWS_DEFAULT_REGION: us-west-004
-          B2_ENDPOINT: ${{ secrets.B2_S3_ENDPOINT }}          # https://s3.us-west-004.backblazeb2.com
-          B2_BUCKET: ${{ secrets.B2_RVC_ASSETS_BUCKET }}      # rvc-inferencing-assets
+          B2_ENDPOINT: ${{ secrets.B2_S3_ENDPOINT }}
+          B2_BUCKET: ${{ secrets.B2_RVC_ASSETS_BUCKET }}
         run: |
           set -euo pipefail
-          aws s3 cp "s3://${B2_BUCKET}/hubert_base.pt" "./hubert_base.pt" --endpoint-url "${B2_ENDPOINT}"
+          aws s3 cp "s3://${B2_BUCKET}/hubert_base.pt" "./hubert_base.pt" \
+            --endpoint-url "${B2_ENDPOINT}"
           ls -lah ./hubert_base.pt
 
       - name: Set up Docker Buildx
