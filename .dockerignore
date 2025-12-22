@@ -1,0 +1,36 @@
+# --- git / python junk ---
+.git
+.gitignore
+.gitattributes
+.github
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+
+# --- OS/editor junk ---
+**/.DS_Store
+**/Thumbs.db
+**/.vscode/
+**/.idea/
+
+# --- runtime/user data (should never be baked) ---
+data/
+input/
+output/
+outputs/
+logs/
+tmp/
+temp/
+cache/
+
+# --- common large artifacts ---
+**/*.zip
+**/*.tar
+**/*.tar.gz
+**/*.7z
+
+# NOTE:
+# Do NOT ignore hubert_base.pt (downloaded in CI and baked into the image)
