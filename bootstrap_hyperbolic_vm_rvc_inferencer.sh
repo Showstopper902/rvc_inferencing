@@ -5,7 +5,9 @@ LOGIN_USER="${SUDO_USER:-$USER}"
 DATA_ROOT="/data"
 DATA_HOST="/data_host"
 
-echo "==> Bootstrapping Hyperbolic VM for rvc_inferencing (infer only)"
+INFER_IMAGE="${INFER_IMAGE:-ghcr.io/showstopper902/rvc_inferencing:latest}"
+
+echo "==> Bootstrapping Hyperbolic VM for rvc_inferencing (infer only) — public images, no registry login"
 echo "==> LOGIN_USER=$LOGIN_USER"
 
 sudo apt-get update -y
@@ -61,10 +63,11 @@ fi
 # Secrets skeletons
 if [[ ! -f "$DATA_ROOT/secrets/b2.env" ]]; then
   sudo tee "$DATA_ROOT/secrets/b2.env" >/dev/null <<'EOF'
-# Backblaze B2 (S3-compatible)
+# Backblaze B2 (S3-compatible) credentials for inferencing sync
+# Fill these values before running the inferencer container.
 B2_SYNC=1
-B2_BUCKET=hyperbolic-project-data
-B2_S3_ENDPOINT=https://s3.us-west-004.backblazeb2.com
+B2_BUCKET=REPLACE_ME
+B2_S3_ENDPOINT=REPLACE_ME
 AWS_ACCESS_KEY_ID=REPLACE_ME
 AWS_SECRET_ACCESS_KEY=REPLACE_ME
 EOF
@@ -72,30 +75,10 @@ EOF
   sudo chown "$LOGIN_USER:docker" "$DATA_ROOT/secrets/b2.env"
 fi
 
-if [[ ! -f "$DATA_ROOT/secrets/ghcr.env" ]]; then
-  sudo tee "$DATA_ROOT/secrets/ghcr.env" >/dev/null <<'EOF'
-# GHCR login (private images)
-GHCR_USERNAME=Showstopper902
-GHCR_TOKEN=REPLACE_ME
-EOF
-  sudo chmod 600 "$DATA_ROOT/secrets/ghcr.env"
-  sudo chown "$LOGIN_USER:docker" "$DATA_ROOT/secrets/ghcr.env"
-fi
 
-# GHCR login + pull infer image
-set +u
-source "$DATA_ROOT/secrets/ghcr.env" || true
-set -u
+# Pull inferencer image (images are PUBLIC by default)
 
-if [[ "${GHCR_TOKEN:-REPLACE_ME}" != "REPLACE_ME" ]]; then
-  echo "==> GHCR login (as $LOGIN_USER)"
-  echo "$GHCR_TOKEN" | sudo -u "$LOGIN_USER" -H docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
-else
-  echo "==> NOTE: Set GHCR_TOKEN in $DATA_ROOT/secrets/ghcr.env to auto-login/pull."
-fi
-
-echo "==> Pulling inferencer image..."
-sudo -u "$LOGIN_USER" -H docker pull ghcr.io/showstopper902/rvc_inferencing:latest || true
+sudo -u "$LOGIN_USER" -H docker pull "$INFER_IMAGE" || true
 
 echo
 echo "==> Bootstrap complete."
