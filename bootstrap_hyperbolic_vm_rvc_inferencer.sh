@@ -5,6 +5,9 @@ LOGIN_USER="${SUDO_USER:-$USER}"
 DATA_ROOT="/data"
 DATA_HOST="/data_host"
 
+HYPER_PROJECT_RAW_BASE="https://raw.githubusercontent.com/Showstopper902/hyperbolic_project/main"
+EXECUTOR_URL="$HYPER_PROJECT_RAW_BASE/scripts/hyper_executor_loop.sh"
+
 echo "==> Bootstrapping Hyperbolic VM for rvc_inferencing (infer only)"
 echo "==> LOGIN_USER=$LOGIN_USER"
 
@@ -39,17 +42,18 @@ if ! command -v nvidia-ctk >/dev/null 2>&1; then
   '
 fi
 
-# /data layout (do not wipe anything here)
+# /data layout
 sudo mkdir -p \
   "$DATA_ROOT/data" \
   "$DATA_ROOT/input" \
-  "$DATA_ROOT/secrets"
+  "$DATA_ROOT/secrets" \
+  "$DATA_ROOT/bin"
 
 sudo chown -R root:docker "$DATA_ROOT"
-sudo chmod 2775 "$DATA_ROOT" "$DATA_ROOT/data" "$DATA_ROOT/input"
+sudo chmod 2775 "$DATA_ROOT" "$DATA_ROOT/data" "$DATA_ROOT/input" "$DATA_ROOT/bin"
 sudo chmod 2770 "$DATA_ROOT/secrets"
 
-# Bind mount /data -> /data_host for consistency
+# Bind mount /data -> /data_host
 sudo mkdir -p "$DATA_HOST"
 if ! mountpoint -q "$DATA_HOST"; then
   sudo mount --bind "$DATA_ROOT" "$DATA_HOST"
@@ -58,7 +62,7 @@ if ! grep -qE "^$DATA_ROOT[[:space:]]+$DATA_HOST[[:space:]]+none[[:space:]]+bind
   echo "$DATA_ROOT $DATA_HOST none bind 0 0" | sudo tee -a /etc/fstab >/dev/null
 fi
 
-# Secrets skeletons
+# Secrets skeletons (fill manually for now)
 if [[ ! -f "$DATA_ROOT/secrets/b2.env" ]]; then
   sudo tee "$DATA_ROOT/secrets/b2.env" >/dev/null <<'EOF'
 # Backblaze B2 (S3-compatible)
@@ -69,43 +73,15 @@ AWS_ACCESS_KEY_ID=REPLACE_ME
 AWS_SECRET_ACCESS_KEY=REPLACE_ME
 EOF
   sudo chmod 600 "$DATA_ROOT/secrets/b2.env"
-  sudo chown "$LOGIN_USER:docker" "$DATA_ROOT/secrets/b2.env"
+  sudo chown "$LOGIN_USER:docker" "$DATA_ROOT/secrets/b2.env" || true
 fi
 
-if [[ ! -f "$DATA_ROOT/secrets/ghcr.env" ]]; then
-  sudo tee "$DATA_ROOT/secrets/ghcr.env" >/dev/null <<'EOF'
-# GHCR login (private images)
-GHCR_USERNAME=Showstopper902
-GHCR_TOKEN=REPLACE_ME
-EOF
-  sudo chmod 600 "$DATA_ROOT/secrets/ghcr.env"
-  sudo chown "$LOGIN_USER:docker" "$DATA_ROOT/secrets/ghcr.env"
-fi
+# Install hyper executor loop (still canonical from hyperbolic_project/scripts/)
+echo "==> Installing hyper executor loop from: $EXECUTOR_URL"
+sudo curl -fsSL "$EXECUTOR_URL" -o "$DATA_ROOT/bin/hyper_executor_loop.sh"
+sudo chmod +x "$DATA_ROOT/bin/hyper_executor_loop.sh"
 
-# GHCR login + pull infer image
-set +u
-source "$DATA_ROOT/secrets/ghcr.env" || true
-set -u
-
-if [[ "${GHCR_TOKEN:-REPLACE_ME}" != "REPLACE_ME" ]]; then
-  echo "==> GHCR login (as $LOGIN_USER)"
-  echo "$GHCR_TOKEN" | sudo -u "$LOGIN_USER" -H docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
-else
-  echo "==> NOTE: Set GHCR_TOKEN in $DATA_ROOT/secrets/ghcr.env to auto-login/pull."
-fi
-
-echo "==> Pulling inferencer image..."
-sudo -u "$LOGIN_USER" -H docker pull ghcr.io/showstopper902/rvc_inferencing:latest || true
-
-echo
-
-echo "==> Installing hyper executor loop (poll + idle terminate)..."
-BIN_DIR="/data/bin"
-sudo mkdir -p "$BIN_DIR"
-sudo curl -fsSL https://raw.githubusercontent.com/Showstopper902/hyperbolic_project/main/hyper_executor_loop.sh -o "$BIN_DIR/hyper_executor_loop.sh"
-sudo chmod +x "$BIN_DIR/hyper_executor_loop.sh"
-
-# systemd service so it runs automatically after bootstrap
+# systemd service
 sudo tee /etc/systemd/system/hyper-executor.service >/dev/null <<'EOF'
 [Unit]
 Description=Hyperbolic GPU Executor Loop
@@ -114,7 +90,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Configure defaults here; override by creating /data/secrets/hyper_executor.env
 Environment=BRAIN_URL=https://hyper-brain.fly.dev
 Environment=WORKER_ID=hyperbolic-pool
 Environment=IDLE_SECONDS=180
@@ -130,6 +105,7 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now hyper-executor.service
-echo "==> hyper-executor.service enabled (will self-terminate after idle)"
+
+echo "==> hyper-executor.service enabled"
 echo "==> Bootstrap complete."
-echo "IMPORTANT: reconnect SSH once so docker group membership applies without sudo."
+echo "NOTE: Docker group membership may require a reconnect for non-sudo docker usage."
