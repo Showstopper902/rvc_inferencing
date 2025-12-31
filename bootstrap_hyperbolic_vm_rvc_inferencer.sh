@@ -5,10 +5,13 @@ LOGIN_USER="${SUDO_USER:-$USER}"
 DATA_ROOT="/data"
 DATA_HOST="/data_host"
 
-HYPER_PROJECT_RAW_BASE="https://raw.githubusercontent.com/Showstopper902/hyperbolic_project/main"
-EXECUTOR_URL="$HYPER_PROJECT_RAW_BASE/scripts/hyper_executor_loop.sh"
+INFER_IMAGE="${INFER_IMAGE:-ghcr.io/showstopper902/rvc_inferencing:latest}"
 
-echo "==> Bootstrapping Hyperbolic VM for rvc_inferencing (infer only)"
+# Canonical source of truth for executor loop (keep ONLY in hyperbolic_project)
+HYPER_PROJECT_RAW_BASE="https://raw.githubusercontent.com/Showstopper902/hyperbolic_project/main"
+EXECUTOR_URL="${EXECUTOR_URL:-$HYPER_PROJECT_RAW_BASE/scripts/hyper_executor_loop.sh}"
+
+echo "==> Bootstrapping Hyperbolic VM for rvc_inferencing (infer only) — public images, no registry login"
 echo "==> LOGIN_USER=$LOGIN_USER"
 
 sudo apt-get update -y
@@ -23,10 +26,10 @@ sudo usermod -aG docker "$LOGIN_USER" || true
 
 # Fix ~/.docker perms
 sudo -u "$LOGIN_USER" -H mkdir -p "/home/$LOGIN_USER/.docker"
-sudo chown -R "$LOGIN_USER:$LOGIN_USER" "/home/$LOGIN_USER/.docker"
-sudo chmod 700 "/home/$LOGIN_USER/.docker"
+sudo chown -R "$LOGIN_USER:$LOGIN_USER" "/home/$LOGIN_USER/.docker" || true
+sudo chmod 700 "/home/$LOGIN_USER/.docker" || true
 
-# NVIDIA runtime
+# NVIDIA container toolkit (needed for --gpus all)
 if ! command -v nvidia-ctk >/dev/null 2>&1; then
   sudo bash -lc '
     set -euo pipefail
@@ -42,7 +45,7 @@ if ! command -v nvidia-ctk >/dev/null 2>&1; then
   '
 fi
 
-# /data layout
+# /data layout + perms
 sudo mkdir -p \
   "$DATA_ROOT/data" \
   "$DATA_ROOT/input" \
@@ -62,7 +65,7 @@ if ! grep -qE "^$DATA_ROOT[[:space:]]+$DATA_HOST[[:space:]]+none[[:space:]]+bind
   echo "$DATA_ROOT $DATA_HOST none bind 0 0" | sudo tee -a /etc/fstab >/dev/null
 fi
 
-# Secrets skeletons (fill manually for now)
+# Secrets skeletons (fill manually)
 if [[ ! -f "$DATA_ROOT/secrets/b2.env" ]]; then
   sudo tee "$DATA_ROOT/secrets/b2.env" >/dev/null <<'EOF'
 # Backblaze B2 (S3-compatible)
@@ -76,12 +79,32 @@ EOF
   sudo chown "$LOGIN_USER:docker" "$DATA_ROOT/secrets/b2.env" || true
 fi
 
-# Install hyper executor loop (still canonical from hyperbolic_project/scripts/)
-echo "==> Installing hyper executor loop from: $EXECUTOR_URL"
+# Pull inferencer image (optional)
+echo "==> Pulling inferencer image (optional)..."
+sudo -u "$LOGIN_USER" -H docker pull "$INFER_IMAGE" || true
+
+# Install executor loop + service (same as training VMs)
+echo
+echo "==> Installing hyper executor loop (poll + idle terminate)..."
 sudo curl -fsSL "$EXECUTOR_URL" -o "$DATA_ROOT/bin/hyper_executor_loop.sh"
 sudo chmod +x "$DATA_ROOT/bin/hyper_executor_loop.sh"
 
-# systemd service
+if [[ ! -f "$DATA_ROOT/secrets/hyper_executor.env" ]]; then
+  sudo tee "$DATA_ROOT/secrets/hyper_executor.env" >/dev/null <<'EOF'
+# Required:
+# EXECUTOR_TOKEN="REPLACE_ME"
+
+# Optional overrides:
+BRAIN_URL="https://hyper-brain.fly.dev"
+ASSIGNED_WORKER_ID="hyperbolic-pool"
+POLL_SECONDS="3"
+IDLE_SECONDS="180"
+EXECUTOR_ID="exec-$(hostname)"
+EOF
+  sudo chmod 600 "$DATA_ROOT/secrets/hyper_executor.env"
+  sudo chown root:docker "$DATA_ROOT/secrets/hyper_executor.env" || true
+fi
+
 sudo tee /etc/systemd/system/hyper-executor.service >/dev/null <<'EOF'
 [Unit]
 Description=Hyperbolic GPU Executor Loop
@@ -90,10 +113,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=BRAIN_URL=https://hyper-brain.fly.dev
-Environment=WORKER_ID=hyperbolic-pool
-Environment=IDLE_SECONDS=180
-Environment=EXECUTOR_ID=%H
 EnvironmentFile=-/data/secrets/hyper_executor.env
 ExecStart=/bin/bash /data/bin/hyper_executor_loop.sh
 Restart=on-failure
@@ -106,6 +125,7 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now hyper-executor.service
 
-echo "==> hyper-executor.service enabled"
+echo
 echo "==> Bootstrap complete."
-echo "NOTE: Docker group membership may require a reconnect for non-sudo docker usage."
+echo "TIP: You can watch executor logs with: sudo journalctl -u hyper-executor -f"
+echo "NOTE: reconnect SSH once so docker group membership applies without sudo."
