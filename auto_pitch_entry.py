@@ -16,7 +16,9 @@ import json
 import math
 import os
 import subprocess
-from typing import Optional
+from glob import glob
+from shutil import which
+from typing import Optional, List
 
 import numpy as np
 import soundfile as sf
@@ -24,6 +26,65 @@ import librosa
 import pyworld as pw
 
 AUDIO_EXTS = [".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"]
+
+
+def _default_input_root() -> str:
+    # Prefer RunPod convention; fallback for local dev
+    return "/input" if os.path.isdir("/input") else os.path.join(os.getcwd(), "input")
+
+
+def _has_audio_files(folder: str) -> bool:
+    if not os.path.isdir(folder):
+        return False
+    for ext in AUDIO_EXTS:
+        if glob(os.path.join(folder, f"*{ext}")):
+            return True
+    return False
+
+
+def _pick_first_audio_file(folder: str) -> str:
+    matches: List[str] = []
+    for ext in AUDIO_EXTS:
+        matches.extend(glob(os.path.join(folder, f"*{ext}")))
+    matches = sorted(set(matches))
+    if not matches:
+        raise FileNotFoundError(f"No audio files found in {folder}")
+    return matches[0]
+
+
+def _maybe_fetch_song_from_b2(dest_song_dir: str, user: str, model: str, song: str) -> None:
+    """
+    Best-effort: if song files aren't present locally, try to download from Backblaze B2 (S3-compatible)
+    using awscli. This does nothing if aws isn't installed or required env vars are missing.
+    """
+    # If we already have any audio in the song dir, don't fetch.
+    if _has_audio_files(dest_song_dir):
+        return
+
+    bucket = os.getenv("B2_BUCKET", "").strip()
+    endpoint = os.getenv("B2_ENDPOINT", "").strip()
+    key_id = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+    app_key = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+
+    if not bucket or not endpoint or not key_id or not app_key:
+        return
+    if which("aws") is None:
+        return
+
+    # Bucket mirrors filesystem with top-level `input/`
+    # so the remote prefix is: input/<user>/<model>/<song>/
+    remote_prefix = f"input/{user}/{model}/{song}"
+    os.makedirs(dest_song_dir, exist_ok=True)
+
+    cmd = [
+        "aws", "s3", "cp",
+        f"s3://{bucket}/{remote_prefix}",
+        dest_song_dir,
+        "--recursive",
+        "--endpoint-url", endpoint,
+    ]
+    # Don't hard-fail if download fails; caller will error if file still missing.
+    subprocess.run(cmd, check=False)
 
 
 def _resolve_model_path(model_override: Optional[str], user: str, model_name: str) -> str:
@@ -39,12 +100,50 @@ def _resolve_song_input(inp: str) -> str:
       --input relative/path.mp3
       --input song_name    -> ./input/song_name.(wav|mp3|...)
       --input song_name.mp3 (without ./input) -> ./input/song_name.mp3 if exists
+
+    NEW behavior (preferred when SONG_NAME is set):
+      - Uses /input/<user>/<model>/<song>/
+      - Default expected vocals file: /input/<user>/<model>/<song>/vocals.wav
+      - If inp is a filename (has audio extension), tries that inside the song folder
+      - Otherwise prefers vocals.wav if present, else picks the first audio file in the song folder
+      - If song folder not present locally, best-effort fetch from Backblaze (aws s3 cp --recursive)
     """
-    if os.path.exists(inp):
+    # 1) If inp is an existing path, use it.
+    if inp and os.path.exists(inp):
         return inp
 
+    # 2) If SONG_NAME/user/model are available, look in:
+    #    /input/<user>/<model>/<song>/
+    user = os.getenv("USER", "").strip() or os.getenv("USERNAME", "").strip() or os.getenv("RVC_USER", "").strip()
+    model = os.getenv("MODEL_NAME", "").strip() or os.getenv("MODEL", "").strip()
+    song = os.getenv("SONG_NAME", "").strip()
+    input_root = os.getenv("INPUT_ROOT", "").strip() or _default_input_root()
+
+    if user and model and song:
+        song_dir = os.path.join(input_root, user, model, song)
+
+        # Best-effort: fetch from B2 if missing
+        _maybe_fetch_song_from_b2(song_dir, user=user, model=model, song=song)
+
+        # If inp looks like a filename, try inside song_dir
+        ext = os.path.splitext(inp)[1].lower()
+        if inp and ext in AUDIO_EXTS:
+            cand = os.path.join(song_dir, inp)
+            if os.path.exists(cand):
+                return cand
+
+        # Prefer vocals.wav if present
+        vocals_wav = os.path.join(song_dir, "vocals.wav")
+        if os.path.exists(vocals_wav):
+            return vocals_wav
+
+        # Otherwise pick the first audio file in the song folder
+        if _has_audio_files(song_dir):
+            return _pick_first_audio_file(song_dir)
+
+    # 3) Backward-compatible fallbacks (your old behavior)
     cand = os.path.join("./input", inp)
-    if os.path.exists(cand):
+    if inp and os.path.exists(cand):
         return cand
 
     root, ext = os.path.splitext(inp)
@@ -52,12 +151,17 @@ def _resolve_song_input(inp: str) -> str:
         raise FileNotFoundError(f"Input not found: {inp} (also tried {cand})")
 
     for e in AUDIO_EXTS:
-        cand = os.path.join("./input", inp + e)
-        if os.path.exists(cand):
-            return cand
+        cand2 = os.path.join("./input", inp + e)
+        if os.path.exists(cand2):
+            return cand2
+
+    # Final fallback: <cwd>/input (without leading dot)
+    cand3 = os.path.join(_default_input_root(), inp)
+    if inp and os.path.exists(cand3):
+        return cand3
 
     raise FileNotFoundError(
-        f"Input not found: {inp} (also tried ./input/<name>.(wav|mp3|flac|m4a|ogg|aac))"
+        f"Input not found: {inp} (also tried SONG_NAME song folder + vocals.wav, ./input/<name>.(wav|mp3|flac|m4a|ogg|aac), and {cand3})"
     )
 
 
@@ -164,6 +268,13 @@ def main():
 
     if not args.user or not args.model_name:
         raise SystemExit("Must provide --user and --model_name (user/model mode).")
+
+    # Promote args into env so _resolve_song_input can use them consistently.
+    # (We do NOT overwrite if already set.)
+    if args.user and not os.getenv("USER"):
+        os.environ["USER"] = args.user
+    if args.model_name and not os.getenv("MODEL_NAME"):
+        os.environ["MODEL_NAME"] = args.model_name
 
     model_path = _resolve_model_path(args.model, args.user, args.model_name)
     input_path = _resolve_song_input(args.input)

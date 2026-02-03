@@ -1,39 +1,45 @@
 #!/usr/bin/env python3
+"""
+auto_pitch_entry.py
+
+ENTRYPOINT wrapper that:
+- resolves model path from ./data/models/<user>/<model_name>/model.pth
+- reads model.meta.json for target_f0_hz (if present)
+- estimates input f0 (if possible)
+- computes pitch shift automatically (unless --pitch provided)
+- calls rvc_infer_cli.py with the computed pitch
+
+This keeps inferencing separate from training.
+"""
 import argparse
 import json
+import math
 import os
 import subprocess
-import wave
-import math
-import struct
-import tempfile
+from typing import Optional
 
+import numpy as np
+import soundfile as sf
+import librosa
+import pyworld as pw
 
 AUDIO_EXTS = [".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"]
 
 
-def strip_args(argv, keys):
-    """
-    Remove args (and their values) from argv.
-    Example: remove --model X, --input Y, --pitch Z so we can re-add them once.
-    """
-    out = []
-    i = 0
-    keys = set(keys)
-    while i < len(argv):
-        a = argv[i]
-        if a in keys:
-            i += 1
-            # skip value if present and not another flag
-            if i < len(argv) and not argv[i].startswith("--"):
-                i += 1
-            continue
-        out.append(a)
-        i += 1
-    return out
+def _resolve_model_path(model_override: Optional[str], user: str, model_name: str) -> str:
+    if model_override:
+        return model_override
+    return os.path.join("./data/models", user, model_name, "model.pth")
 
 
 def _resolve_song_input(inp: str) -> str:
+    """
+    Supports either:
+      --input /path/to/file.wav
+      --input relative/path.mp3
+      --input song_name    -> ./input/song_name.(wav|mp3|...)
+      --input song_name.mp3 (without ./input) -> ./input/song_name.mp3 if exists
+    """
     if os.path.exists(inp):
         return inp
 
@@ -43,9 +49,7 @@ def _resolve_song_input(inp: str) -> str:
 
     root, ext = os.path.splitext(inp)
     if ext:
-        cand = os.path.join("./input", inp)
-        if os.path.exists(cand):
-            return cand
+        raise FileNotFoundError(f"Input not found: {inp} (also tried {cand})")
 
     for e in AUDIO_EXTS:
         cand = os.path.join("./input", inp + e)
@@ -53,253 +57,152 @@ def _resolve_song_input(inp: str) -> str:
             return cand
 
     raise FileNotFoundError(
-        f"Input not found: {inp} (also tried ./input/<name>.(wav|mp3|...))"
+        f"Input not found: {inp} (also tried ./input/<name>.(wav|mp3|flac|m4a|ogg|aac))"
     )
 
 
-def _resolve_model_path(model: str | None, user: str | None, model_name: str | None) -> str:
-    if model:
-        return model
-    if user and model_name:
-        return os.path.join("./models", user, model_name, "model.pth")
-    raise ValueError("Provide --model OR (--user and --model_name).")
-
-
-def read_wav_mono(path: str):
-    # Minimal WAV reader (PCM int16/24/32 or float32). Dependency-light.
-    with wave.open(path, "rb") as wf:
-        n_channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        fr = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
-
-    if n_channels < 1:
-        raise ValueError("Invalid WAV: no channels")
-
-    # decode to float mono (use channel 0)
-    if sampwidth == 2:
-        fmt = "<" + "h" * (len(raw) // 2)
-        data = struct.unpack(fmt, raw)
-        scale = 32768.0
-        mono = [data[i] / scale for i in range(0, len(data), n_channels)]
-
-    elif sampwidth == 4:
-        # could be float32 or int32; try float first
-        try:
-            fmt = "<" + "f" * (len(raw) // 4)
-            data = struct.unpack(fmt, raw)
-            mono = [data[i] for i in range(0, len(data), n_channels)]
-        except Exception:
-            fmt = "<" + "i" * (len(raw) // 4)
-            data = struct.unpack(fmt, raw)
-            scale = 2147483648.0
-            mono = [data[i] / scale for i in range(0, len(data), n_channels)]
-
-    elif sampwidth == 3:
-        # 24-bit PCM
-        mono = []
-        step = 3 * n_channels
-        for i in range(0, len(raw), step):
-            b = raw[i:i + 3]
-            v = int.from_bytes(
-                b + (b"\xff" if b[2] & 0x80 else b"\x00"),
-                "little",
-                signed=True,
-            )
-            mono.append(v / 8388608.0)
-
-    else:
-        raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
-
-    return mono, fr
-
-
-def _ffmpeg_to_wav(src_path: str) -> str | None:
-    """
-    Convert non-wav inputs to a temporary mono wav for pitch estimation.
-    Returns temp wav path, or None if conversion fails / ffmpeg missing.
-    """
-    tmp = tempfile.NamedTemporaryFile(prefix="autopitch_", suffix=".wav", delete=False)
-    tmp.close()
-    out_path = tmp.name
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", src_path,
-        "-ac", "1",
-        "-ar", "48000",
-        out_path,
-    ]
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if p.returncode != 0 or not os.path.exists(out_path):
-            try:
-                os.unlink(out_path)
-            except Exception:
-                pass
-            return None
-        return out_path
-    except FileNotFoundError:
-        # ffmpeg not installed
-        try:
-            os.unlink(out_path)
-        except Exception:
-            pass
-        return None
-
-
-def autocorr_pitch_hz(samples, sr, fmin=50.0, fmax=500.0):
-    # Lightweight autocorrelation pitch estimator for a rough median pitch.
-    if not samples or sr <= 0:
-        return None
-
-    # analyze a middle chunk to avoid huge files (max ~8 seconds)
-    max_len = min(len(samples), int(sr * 8))
-    start = max(0, (len(samples) - max_len) // 2)
-    x = samples[start:start + max_len]
-
-    # remove DC
-    mean = sum(x) / len(x)
-    x = [v - mean for v in x]
-
-    frame_len = int(sr * 0.04)  # 40ms
-    hop = int(sr * 0.01)        # 10ms
-    if frame_len <= 0 or hop <= 0 or len(x) < frame_len:
-        return None
-
-    min_lag = int(sr / fmax)
-    max_lag = int(sr / fmin)
-    if max_lag <= min_lag + 1:
-        return None
-
-    pitches = []
-    for i in range(0, len(x) - frame_len, hop):
-        frame = x[i:i + frame_len]
-
-        # energy gate
-        energy = sum(v * v for v in frame) / len(frame)
-        if energy < 1e-5:
-            continue
-
-        best_lag = None
-        best_val = -1e18
-
-        # brute-force autocorr (still OK for small frames)
-        for lag in range(min_lag, max_lag):
-            s = 0.0
-            for j in range(frame_len - lag):
-                s += frame[j] * frame[j + lag]
-            if s > best_val:
-                best_val = s
-                best_lag = lag
-
-        if best_lag and best_val > 0:
-            hz = sr / best_lag
-            if fmin <= hz <= fmax:
-                pitches.append(hz)
-
-    if not pitches:
-        return None
-
-    pitches.sort()
-    return pitches[len(pitches) // 2]
-
-
-def semitone_shift(src_hz, tgt_hz):
-    if not src_hz or not tgt_hz or src_hz <= 0 or tgt_hz <= 0:
-        return 0
-    return int(round(12.0 * math.log2(tgt_hz / src_hz)))
-
-
-def load_target_f0_hz(model_path: str):
-    # model path: ./models/<user>/<model>/model.pth
-    # meta path:  ./models/<user>/<model>/model.meta.json
-    model_dir = os.path.dirname(os.path.abspath(model_path))
-    meta_path = os.path.join(model_dir, "model.meta.json")
+def _read_target_f0_hz_from_meta(model_path: str) -> Optional[float]:
+    meta_path = os.path.join(os.path.dirname(model_path), "model.meta.json")
     if not os.path.exists(meta_path):
         return None
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        v = meta.get("target_f0_hz", None)
-        return float(v) if v is not None else None
-    except Exception:
+        val = meta.get("target_f0_hz", None)
+        if val is None:
+            return None
+        val = float(val)
+        if not math.isfinite(val) or val <= 0:
+            return None
+        return val
+    except Exception as e:
+        print(f"[auto_pitch] WARN: failed reading {meta_path}: {e}")
         return None
 
 
+def _median_f0_hz_from_audio(path: str, target_sr: int = 16000) -> Optional[float]:
+    """
+    Compute median voiced f0 (Hz) using WORLD harvest+stonemask.
+    """
+    try:
+        audio, sr = sf.read(path, always_2d=False)
+    except Exception as e:
+        print(f"[auto_pitch] WARN: failed to read {path}: {e}")
+        return None
+
+    # mono
+    if isinstance(audio, np.ndarray) and audio.ndim == 2:
+        audio = np.mean(audio, axis=1)
+    audio = np.asarray(audio, dtype=np.float32)
+
+    if audio.size < 1:
+        return None
+
+    if sr != target_sr:
+        try:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+            sr = target_sr
+        except Exception as e:
+            print(f"[auto_pitch] WARN: resample failed {path}: {e}")
+            return None
+
+    audio = np.nan_to_num(audio)
+    x = audio.astype(np.float64)
+
+    try:
+        f0, t = pw.harvest(
+            x,
+            fs=sr,
+            f0_floor=50.0,
+            f0_ceil=1100.0,
+            frame_period=10.0,
+        )
+        f0 = pw.stonemask(x, f0, t, sr)
+    except Exception as e:
+        print(f"[auto_pitch] WARN: pyworld failed {path}: {e}")
+        return None
+
+    f0 = np.asarray(f0).reshape(-1)
+    f0 = f0[np.isfinite(f0)]
+    f0 = f0[(f0 > 50.0) & (f0 < 1100.0)]
+    if f0.size == 0:
+        return None
+
+    return float(np.median(f0))
+
+
+def _hz_to_semitones(src_hz: float, dst_hz: float) -> int:
+    """
+    Convert src->dst pitch ratio to nearest semitone integer shift.
+    """
+    if src_hz <= 0 or dst_hz <= 0:
+        return 0
+    st = 12.0 * math.log2(dst_hz / src_hz)
+    if not math.isfinite(st):
+        return 0
+    return int(round(st))
+
+
 def main():
-    # Parse only what we need; pass everything else through (but de-dupe)
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--user", default=None)
-    parser.add_argument("--model_name", default=None)
-    parser.add_argument("--model", default=None)
+    parser = argparse.ArgumentParser(description="Auto pitch wrapper for RVC inference")
+
+    parser.add_argument("--user", default=None, help="Username (for ./data/models/<user>/<model_name>)")
+    parser.add_argument("--model_name", default=None, help="Model name (for ./data/models/<user>/<model_name>)")
+
+    # Optional override (rare)
+    parser.add_argument("--model", default=None, help="Path to model.pth (override)")
+
+    # passthrough to rvc_infer_cli.py
     parser.add_argument("--input", required=True)
-    parser.add_argument("--pitch", type=int, default=None)
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--pitch", type=int, default=None, help="If set, overrides auto pitch")
+    parser.add_argument("--f0_method", default="harvest")
+    parser.add_argument("--index_rate", type=float, default=0.5)
+    parser.add_argument("--crepe_hop_length", type=int, default=128)
+
     args, passthru = parser.parse_known_args()
 
-    # Resolve paths early (so we can also support --input song_name)
+    if not args.user or not args.model_name:
+        raise SystemExit("Must provide --user and --model_name (user/model mode).")
+
     model_path = _resolve_model_path(args.model, args.user, args.model_name)
     input_path = _resolve_song_input(args.input)
 
-    # Remove duplicates so we pass a clean argv to rvc_infer_cli.py
-    passthru = strip_args(
-        passthru,
-        {"--model", "--input", "--pitch", "--user", "--model_name"},
-    )
-
-    # If user provided --pitch explicitly, respect it.
-    if args.pitch is not None:
-        cmd = ["python3", "/app/rvc_infer_cli.py"]
-        if args.user and args.model_name:
-            cmd += ["--user", args.user, "--model_name", args.model_name]
-        cmd += ["--model", model_path, "--input", input_path, "--pitch", str(args.pitch)] + passthru
-        return subprocess.call(cmd)
-
-    # Auto compute pitch (optional)
-    target = load_target_f0_hz(model_path)
-    if not target:
-        auto_pitch = 0
-        print("[auto_pitch] No target_f0_hz found in model.meta.json → using pitch=0")
-    else:
-        wav_for_pitch = input_path
-        tmp_wav = None
-        if not input_path.lower().endswith(".wav"):
-            tmp_wav = _ffmpeg_to_wav(input_path)
-            if tmp_wav:
-                wav_for_pitch = tmp_wav
-            else:
-                print("[auto_pitch] Non-wav input but ffmpeg convert failed → using pitch=0")
-                target = None  # force 0
-
-        if not target:
-            auto_pitch = 0
+    # If user explicitly passed pitch, do not compute.
+    pitch = args.pitch
+    if pitch is None:
+        target_f0 = _read_target_f0_hz_from_meta(model_path)
+        if target_f0 is None:
+            print("[auto_pitch] No target_f0_hz in model.meta.json. Using pitch=0.")
+            pitch = 0
         else:
-            try:
-                samples, sr = read_wav_mono(wav_for_pitch)
-                src = autocorr_pitch_hz(samples, sr)
-                if src:
-                    auto_pitch = semitone_shift(src, target)
-                    print(f"[auto_pitch] src≈{src:.2f}Hz target≈{target:.2f}Hz → pitch={auto_pitch}")
-                else:
-                    auto_pitch = 0
-                    print("[auto_pitch] Could not estimate src pitch → using pitch=0")
-            except Exception as e:
-                auto_pitch = 0
-                print(f"[auto_pitch] Exception estimating pitch ({e}) → using pitch=0")
-            finally:
-                if tmp_wav:
-                    try:
-                        os.unlink(tmp_wav)
-                    except Exception:
-                        pass
+            src_f0 = _median_f0_hz_from_audio(input_path)
+            if src_f0 is None:
+                print("[auto_pitch] Could not estimate input f0. Using pitch=0.")
+                pitch = 0
+            else:
+                pitch = _hz_to_semitones(src_f0, target_f0)
+                print(f"[auto_pitch] input_f0={src_f0:.2f} Hz, target_f0={target_f0:.2f} Hz -> pitch={pitch} st")
 
-    cmd = ["python3", "/app/rvc_infer_cli.py"]
-    if args.user and args.model_name:
-        cmd += ["--user", args.user, "--model_name", args.model_name]
-    cmd += ["--model", model_path, "--input", input_path, "--pitch", str(auto_pitch)] + passthru
-    return subprocess.call(cmd)
+    # Call the actual inferencer
+    cmd = ["python3", "/app/rvc_infer_cli.py", "--user", args.user, "--model_name", args.model_name]
+    cmd += [
+        "--model", model_path,
+        "--input", input_path,
+        "--pitch", str(int(pitch)),
+        "--f0_method", args.f0_method,
+        "--index_rate", str(float(args.index_rate)),
+        "--crepe_hop_length", str(int(args.crepe_hop_length)),
+    ]
+    if args.output:
+        cmd += ["--output", args.output]
+
+    # passthru unknown args (keeps old behavior)
+    cmd += passthru
+
+    print("[auto_pitch] running:", " ".join(cmd))
+    subprocess.check_call(cmd)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
