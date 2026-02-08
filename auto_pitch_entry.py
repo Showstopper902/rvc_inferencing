@@ -16,7 +16,9 @@ import json
 import math
 import os
 import subprocess
+import sys
 from glob import glob
+from pathlib import Path
 from shutil import which
 from typing import Optional, List
 
@@ -62,7 +64,7 @@ def _maybe_fetch_song_from_b2(dest_song_dir: str, user: str, model: str, song: s
         return
 
     bucket = os.getenv("B2_BUCKET", "").strip()
-    endpoint = os.getenv("B2_ENDPOINT", "").strip()
+    endpoint = os.getenv("B2_S3_ENDPOINT", "").strip()
     key_id = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
     app_key = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
 
@@ -296,7 +298,8 @@ def main():
                 print(f"[auto_pitch] input_f0={src_f0:.2f} Hz, target_f0={target_f0:.2f} Hz -> pitch={pitch} st")
 
     # Call the actual inferencer
-    cmd = ["python3", "/app/rvc_infer_cli.py", "--user", args.user, "--model_name", args.model_name]
+    rvc_cli = os.getenv("RVC_INFER_CLI", str(Path(__file__).resolve().parent / "rvc_infer_cli.py"))
+    cmd = [sys.executable, rvc_cli, "--user", args.user, "--model_name", args.model_name]
     cmd += [
         "--model", model_path,
         "--input", input_path,
