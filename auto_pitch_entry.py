@@ -265,6 +265,7 @@ def main():
     parser.add_argument("--f0_method", default="harvest")
     parser.add_argument("--index_rate", type=float, default=0.5)
     parser.add_argument("--crepe_hop_length", type=int, default=128)
+    parser.add_argument("--index", default=None, help="Path to FAISS index file (optional; forwarded to rvc_infer_cli.py)")
 
     args, passthru = parser.parse_known_args()
 
@@ -310,6 +311,9 @@ def main():
     ]
     if args.output:
         cmd += ["--output", args.output]
+
+    if args.index:
+        cmd += ["--index", args.index]
 
     # passthru unknown args (keeps old behavior)
     cmd += passthru
