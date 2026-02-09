@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import hashlib
 
 from rvc_core import get_vc, vc_single
 
 AUDIO_EXTS = [".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac"]
+
+def _md5(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 
 def _resolve_song_input(inp: str) -> str:
@@ -110,10 +119,14 @@ def main():
 
     model_dir = _model_dir(args.user, args.model_name)
     model_path = args.model or os.path.join(model_dir, "model.pth")
+
+    # If caller overrides --model with an alternate path, resolve the index from that model's directory
+    # unless --index is explicitly provided.
+    model_dir_for_index = os.path.dirname(model_path) if args.model else model_dir
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    index_path = args.index or _resolve_index_path(model_dir)
+    index_path = args.index or _resolve_index_path(model_dir_for_index)
 
     input_path = _resolve_song_input(args.input)
     output_path = _resolve_output_path(args.output, args.user, args.model_name, input_path)
@@ -138,6 +151,20 @@ def main():
         args.crepe_hop_length,
         output_path,
     )
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"RVC did not produce an output file: {output_path}")
+
+    # Fail hard if output is byte-identical to input (likely passthrough / no conversion)
+    in_md5 = _md5(input_path)
+    out_md5 = _md5(output_path)
+    print(f"Input MD5:  {in_md5}")
+    print(f"Output MD5: {out_md5}")
+    if in_md5 == out_md5:
+        raise RuntimeError(
+            "RVC output is identical to input (no conversion applied). "
+            "Verify model path, index usage, and inference runtime."
+        )
 
     print(f"✅ Done! Output saved to {output_path}")
 
