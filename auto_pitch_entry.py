@@ -180,6 +180,12 @@ def _read_target_f0_hz_from_meta(model_path: str) -> Optional[float]:
         val = float(val)
         if not math.isfinite(val) or val <= 0:
             return None
+
+        # Treat meta target as a "speaking" baseline; convert to a "singing" target.
+        # +6 semitones ~= x1.414, which matches your example: 120 Hz -> ~170 Hz.
+        SINGING_OFFSET_ST = 6.0
+        val = val * (2.0 ** (SINGING_OFFSET_ST / 12.0))
+
         return val
     except Exception as e:
         print(f"[auto_pitch] WARN: failed reading {meta_path}: {e}")
