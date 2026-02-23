@@ -183,7 +183,7 @@ def _read_target_f0_hz_from_meta(model_path: str) -> Optional[float]:
 
         # Treat meta target as a "speaking" baseline; convert to a "singing" target.
         # +6 semitones ~= x1.414, which matches your example: 120 Hz -> ~170 Hz.
-        SINGING_OFFSET_ST = 4.0
+        SINGING_OFFSET_ST = 6.0
         val = val * (2.0 ** (SINGING_OFFSET_ST / 12.0))
 
         return val
