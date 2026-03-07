@@ -340,39 +340,6 @@ def main():
     print("[auto_pitch] running:", " ".join(cmd))
     subprocess.check_call(cmd)
 
-    # ---------------------------------------------------------
-    # Cleanup: remove per‑job directories after inference
-    # ---------------------------------------------------------
-    # Remove the directory containing the input file to free disk space. For
-    # example, if input_path = /input/user/model/song/vocals.wav, this removes
-    # /input/user/model/song. Avoid accidentally deleting unrelated data by
-    # checking that the path exists and is a directory.
-    try:
-        in_dir = os.path.dirname(os.path.abspath(input_path))
-        if os.path.isdir(in_dir):
-            shutil.rmtree(in_dir, ignore_errors=True)
-    except Exception:
-        pass
-
-    # Remove the directory containing the output (if specified)
-    if args.output:
-        try:
-            out_dir = os.path.dirname(os.path.abspath(args.output))
-            if os.path.isdir(out_dir):
-                shutil.rmtree(out_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-    # Remove the model directory (user/model) to free disk space. This does not
-    # affect shared or pre‑downloaded models, since the path includes the user
-    # and model_name.
-    try:
-        model_dir = os.path.dirname(os.path.abspath(model_path))
-        if os.path.isdir(model_dir):
-            shutil.rmtree(model_dir, ignore_errors=True)
-    except Exception:
-        pass
-
 
 if __name__ == "__main__":
     main()
